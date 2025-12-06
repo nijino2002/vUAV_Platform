@@ -4,8 +4,12 @@ import socket
 import threading
 from pymavlink import mavutil
 
+# PX4 SITL 在容器里的 MAVLink 监听端口
 MAVLINK_URL = "udp:127.0.0.1:14540"
+
+# agent 在容器里监听的 TCP 地址（配合 -p 1600x:6000 映射到宿主）
 AGENT_LISTEN_ADDR = ("0.0.0.0", 6000)
+
 RAD2DEG = 57.29577951308232
 
 
@@ -29,7 +33,7 @@ def send_command_long(mav, command, params, timeout=2.0):
         0,
         *params
     )
-    ack = mav.recv_match(type='COMMAND_ACK', blocking=True, timeout=timeout)
+    ack = mav.recv_match(type="COMMAND_ACK", blocking=True, timeout=timeout)
     if not ack:
         return {"ok": False, "error": "no COMMAND_ACK"}
 
@@ -57,9 +61,25 @@ def process_request(req, mav):
         return {
             "ok": True,
             "type": "attitude",
-            "roll_deg":  msg.roll  * RAD2DEG,
+            "roll_deg": msg.roll * RAD2DEG,
             "pitch_deg": msg.pitch * RAD2DEG,
-            "yaw_deg":   msg.yaw   * RAD2DEG,
+            "yaw_deg": msg.yaw * RAD2DEG,
+        }
+
+    if cmd == "get_local_position":
+        # 等待 LOCAL_POSITION_NED 消息并返回
+        msg = mav.recv_match(type="LOCAL_POSITION_NED", blocking=True, timeout=1.0)
+        if msg is None:
+            return {"ok": False, "error": "no LOCAL_POSITION_NED"}
+        return {
+            "ok": True,
+            "type": "local_position",
+            "x": float(msg.x),   # NED坐标系下的X坐标
+            "y": float(msg.y),   # NED坐标系下的Y坐标
+            "z": float(msg.z),   # NED坐标系下的Z坐标，通常Z向下为正
+            "vx": float(msg.vx), # X方向速度
+            "vy": float(msg.vy), # Y方向速度
+            "vz": float(msg.vz), # Z方向速度
         }
 
     if cmd == "get_status":
@@ -71,9 +91,9 @@ def process_request(req, mav):
             "ok": True,
             "type": "status",
             "attitude": {
-                "roll_deg":  msg.roll  * RAD2DEG,
+                "roll_deg": msg.roll * RAD2DEG,
                 "pitch_deg": msg.pitch * RAD2DEG,
-                "yaw_deg":   msg.yaw   * RAD2DEG,
+                "yaw_deg": msg.yaw * RAD2DEG,
             },
         }
 
@@ -127,9 +147,20 @@ def handle_client(conn, addr, mav):
                     req = json.loads(line.decode("utf-8"))
                 except Exception as e:
                     print(f"[agent] bad json from {addr}: {e}")
-                    continue
-                resp = process_request(req, mav)
-                conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+                    resp = {"ok": False, "error": f"bad json: {e}"}
+                else:
+                    try:
+                        resp = process_request(req, mav)
+                    except Exception as e:
+                        # 防止任何命令处理异常导致直接断连接
+                        print(f"[agent] handler exception for {addr}: {e}")
+                        resp = {"ok": False, "error": f"handler exception: {e}"}
+
+                try:
+                    conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+                except Exception as e:
+                    print(f"[agent] send error to {addr}: {e}")
+                    return
     print(f"[agent] client disconnected from {addr}")
 
 
@@ -137,6 +168,7 @@ def agent_main():
     mav = mavlink_connect()
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(AGENT_LISTEN_ADDR)
     s.listen(5)
     print(f"[agent] listening on {AGENT_LISTEN_ADDR[0]}:{AGENT_LISTEN_ADDR[1]}")
