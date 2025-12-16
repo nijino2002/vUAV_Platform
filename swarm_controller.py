@@ -2,12 +2,52 @@
 import json
 import socket
 import time
+import os
+from pathlib import Path
 
-VUS = {
-    "vuav1": ("127.0.0.1", 16001),
-    "vuav2": ("127.0.0.1", 16002),
-    "vuav3": ("127.0.0.1", 16003),
-}
+# ===================== vUAV 集群配置加载（松耦合） =====================
+
+DEFAULT_CONFIG_PATH = "vuav_cluster_config.json"
+
+
+def load_vus(config_path=None):
+    """
+    优先从 JSON 配置文件加载 vUAV 列表；
+    如果没有配置文件，则退回到当前默认：只连 vuav1 -> 127.0.0.1:6000
+    """
+    path = config_path or os.environ.get("VUAV_CONFIG", DEFAULT_CONFIG_PATH)
+    cfg = Path(path)
+
+    if not cfg.exists():
+        print(f"[INFO] config file {cfg} not found, use built-in VUS")
+        vus = {
+            "vuav1": ("127.0.0.1", 6000),
+        }
+        for name, addr in vus.items():
+            print(f"       {name}: {addr[0]}:{addr[1]}")
+        return vus
+
+    print(f"[INFO] loading VUS from {cfg}")
+    with cfg.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    vus = {}
+    for name, item in data.items():
+        host = item.get("host")
+        port = int(item.get("port", 6000))
+        if not host:
+            raise ValueError(f"invalid config for {name}: missing 'host'")
+        vus[name] = (host, port)
+
+    for name, addr in vus.items():
+        print(f"       {name}: {addr[0]}:{addr[1]}")
+    return vus
+
+
+# 现在 VUS 不再硬编码，而是“可配置”
+VUS = load_vus()
+
+# ===================== 原来的逻辑保持不变 =====================
 
 
 def send_cmd(addr, cmd, timeout=3.0):
@@ -128,6 +168,37 @@ def broadcast_velocity_ned(vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0):
         call(name, cmd)
 
 
+def experiment_velocity_forward(duration=5.0, interval=0.5, vx=0.5):
+    """
+    一个简单的“向前推一推”的速度实验：
+      - 每隔 interval 秒对全体 vUAV 广播一次 set_velocity_ned(vx, 0, 0, 0)
+      - 同时读取并打印当前位置，便于观察效果
+    """
+    steps = int(duration / interval)
+    print(
+        f"\n=== velocity forward experiment: "
+        f"duration={duration}s, interval={interval}s, vx={vx} m/s ==="
+    )
+
+    for i in range(steps):
+        print(f"\n--- velocity step {i+1}/{steps} ---")
+        # 1) 下发速度指令
+        broadcast_velocity_ned(vx=vx, vy=0.0, vz=0.0, yaw_rate=0.0)
+
+        # 2) 读取一次当前位置
+        for name in VUS:
+            resp = call(name, {"cmd": "get_local_position"})
+            if resp.get("ok") and resp.get("type") == "local_position":
+                x = resp["x"]
+                y = resp["y"]
+                z = resp["z"]
+                print(f"[{name}] pos(after vel cmd): x={x:.2f}, y={y:.2f}, z={z:.2f}")
+            else:
+                print(f"[{name}] get_local_position FAILED: {resp}")
+
+        time.sleep(interval)
+
+
 if __name__ == "__main__":
     # 1. ping 所有 vUAV，验证 agent 通不通
     broadcast({"cmd": "ping"})
@@ -148,9 +219,8 @@ if __name__ == "__main__":
     # 6. 起飞后 10 秒内，每秒看一次 LOCAL_POSITION_NED（全状态）
     monitor_local_position(ticks=10, interval=1.0)
 
-    # 7. 再做一轮“高度曲线监控”，更聚焦看高度变化
+    # 7. 做一轮“高度曲线监控”，更聚焦看高度变化
     monitor_altitude_curve(ticks=10, interval=1.0)
 
-    # 后续如果你想试一下速度指令，可以在这里手动加一句，例如：
-    # broadcast_velocity_ned(vx=1.0, vy=0.0, vz=0.0, yaw_rate=0.0)
-
+    # 8. 简单的“向前速度”实验
+    experiment_velocity_forward(duration=5.0, interval=0.5, vx=0.5)
